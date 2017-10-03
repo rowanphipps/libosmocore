@@ -20,6 +20,7 @@
 /*! Number of bytes necessary to store given BITS */
 #define OSMO_BYTES_FOR_BITS(BITS) ((BITS + 8 - 1) / 8)
 
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 
@@ -88,5 +89,7 @@ uint64_t osmo_decode_big_endian(const uint8_t *data, size_t data_len);
 uint8_t *osmo_encode_big_endian(uint64_t value, size_t data_len);
 
 size_t osmo_strlcpy(char *dst, const char *src, size_t siz);
+
+bool osmo_identifier_valid(const char *str);
 
 /*! @} */
