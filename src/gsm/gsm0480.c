@@ -194,8 +194,8 @@ struct msgb *gsm0480_create_notifySS(const char *text)
 /* Forward declarations */
 static int parse_ss(const struct gsm48_hdr *hdr,
 		    uint16_t len, struct ss_request *req);
-static int parse_ss_info_elements(const uint8_t *ussd_ie, uint16_t len,
-				  struct ss_request *req);
+static int parse_ss_info_elements(const uint8_t *ss_ie, uint16_t len,
+				  struct ss_request *req, uint8_t msg_type);
 static int parse_facility_ie(const uint8_t *facility_ie, uint16_t length,
 			     struct ss_request *req);
 static int parse_ss_invoke(const uint8_t *invoke_data, uint16_t length,
@@ -269,6 +269,13 @@ static int parse_ss(const struct gsm48_hdr *hdr, uint16_t len, struct ss_request
 {
 	int rc = 1;
 	uint8_t msg_type = hdr->msg_type & 0x3F;  /* message-type - section 3.4 */
+	int8_t offset = 0;
+	req->opcode = 0;
+	if (hdr->msg_type != 0x7b) {
+		req->opcode = 0x3C;
+		offset = -1;
+	}
+	req->message_type = msg_type;
 
 	switch (msg_type) {
 	case GSM0480_MTYPE_RELEASE_COMPLETE:
@@ -278,7 +285,8 @@ static int parse_ss(const struct gsm48_hdr *hdr, uint16_t len, struct ss_request
 		break;
 	case GSM0480_MTYPE_REGISTER:
 	case GSM0480_MTYPE_FACILITY:
-		rc &= parse_ss_info_elements(&hdr->data[0], len - sizeof(*hdr), req);
+		LOGP(0, LOGL_DEBUG, "MType: Facility\n");
+		rc &= parse_ss_info_elements(&hdr->data[0], len - sizeof(*hdr), req, hdr->msg_type);
 		break;
 	default:
 		LOGP(0, LOGL_DEBUG, "Unknown GSM 04.80 message-type field 0x%02x\n",
@@ -291,25 +299,32 @@ static int parse_ss(const struct gsm48_hdr *hdr, uint16_t len, struct ss_request
 }
 
 static int parse_ss_info_elements(const uint8_t *ss_ie, uint16_t len,
-				  struct ss_request *req)
+				  struct ss_request *req, uint8_t msg_type)
 {
 	int rc = -1;
 	/* Information Element Identifier - table 3.2 & GSM 04.08 section 10.5 */
 	uint8_t iei;
 	uint8_t iei_length;
+	uint8_t offset = 2;
 
-	iei = ss_ie[0];
-	iei_length = ss_ie[1];
+	if (msg_type != 0x7b) {
+		iei = 0x1c;
+		iei_length = ss_ie[0];
+		offset = 1;
+	} else {
+		iei = ss_ie[0];
+		iei_length = ss_ie[1];
+	}
 
 	/* If the data does not fit, report an error */
-	if (len - 2 < iei_length)
+	if (len - offset < iei_length)
 		return 0;
 
 	switch (iei) {
 	case GSM48_IE_CAUSE:
 		break;
 	case GSM0480_IE_FACILITY:
-		rc = parse_facility_ie(ss_ie + 2, iei_length, req);
+		rc = parse_facility_ie(ss_ie + offset, iei_length, req);
 		break;
 	case GSM0480_IE_SS_VERSION:
 		break;
@@ -334,6 +349,8 @@ static int parse_facility_ie(const uint8_t *facility_ie, uint16_t length,
 		uint8_t component_type = facility_ie[offset];
 		uint8_t component_length = facility_ie[offset+1];
 
+		req->component_type = component_type;
+
 		/* size check */
 		if (offset + 2 + component_length > length) {
 			LOGP(0, LOGL_ERROR, "Component does not fit.\n");
@@ -341,6 +358,8 @@ static int parse_facility_ie(const uint8_t *facility_ie, uint16_t length,
 		}
 
 		switch (component_type) {
+		case GSM0480_CTYPE_RETURN_RESULT:
+			LOGP(0, LOGL_DEBUG, "CTYPE_RETURN_RESULT\n");
 		case GSM0480_CTYPE_INVOKE:
 			rc &= parse_ss_invoke(facility_ie+2,
 					      component_length,
@@ -349,6 +368,7 @@ static int parse_facility_ie(const uint8_t *facility_ie, uint16_t length,
 		case GSM0480_CTYPE_RETURN_RESULT:
 			break;
 		case GSM0480_CTYPE_RETURN_ERROR:
+			LOGP(0, LOGL_DEBUG, "CTYPE_RETURN_ERROR\n");
 			break;
 		case GSM0480_CTYPE_REJECT:
 			break;
@@ -392,12 +412,15 @@ static int parse_ss_invoke(const uint8_t *invoke_data, uint16_t length,
 		offset += invoke_data[offset+1] + 2;  /* skip over it */
 
 	/* mandatory part */
-	if (invoke_data[offset] == GSM0480_OPERATION_CODE) {
+	if (invoke_data[offset] == GSM0480_OPERATION_CODE || req->opcode != 0) {
 		if (offset + 2 > length)
 			return 0;
-		uint8_t operation_code = invoke_data[offset+2];
-		req->opcode = operation_code;
-		switch (operation_code) {
+		if (req->opcode == 0) {
+			uint8_t operation_code = invoke_data[offset+2];
+			req->opcode = operation_code;
+		}
+		switch (req->opcode) {
+		case GSM0480_OP_CODE_USS_REQUEST:
 		case GSM0480_OP_CODE_PROCESS_USS_REQ:
 			rc = parse_process_uss_req(invoke_data + offset + 3,
 						   length - offset - 3,
@@ -412,7 +435,7 @@ static int parse_ss_invoke(const uint8_t *invoke_data, uint16_t length,
 			break;
 		default:
 			LOGP(0, LOGL_DEBUG, "GSM 04.80 operation code 0x%02x "
-				"is not yet handled\n", operation_code);
+				"is not yet handled\n", req->opcode);
 			rc = 0;
 			break;
 		}
@@ -433,25 +456,29 @@ static int parse_process_uss_req(const uint8_t *uss_req_data, uint16_t length,
 	int rc = 0;
 	int num_chars;
 	uint8_t dcs;
+	uint8_t offset = 0;
 
+	if (req->message_type == 0x3A){
+		offset = 2;
+	}
 
 	/* we need at least that much */
 	if (length < 8)
 		return 0;
 
 
-	if (uss_req_data[0] == GSM_0480_SEQUENCE_TAG) {
-		if (uss_req_data[2] == ASN1_OCTET_STRING_TAG) {
-			dcs = uss_req_data[4];
+	if (uss_req_data[0 + offset] == GSM_0480_SEQUENCE_TAG) {
+		if (uss_req_data[2 + offset] == ASN1_OCTET_STRING_TAG) {
+			dcs = uss_req_data[4 + offset];
 			if ((dcs == 0x0F) &&
-			    (uss_req_data[5] == ASN1_OCTET_STRING_TAG)) {
-				num_chars = (uss_req_data[6] * 8) / 7;
+			    (uss_req_data[5 + offset] == ASN1_OCTET_STRING_TAG)) {
+				num_chars = (uss_req_data[6 + offset] * 8) / 7;
 				/* Prevent a mobile-originated buffer-overrun! */
 				if (num_chars > MAX_LEN_USSD_STRING)
 					num_chars = MAX_LEN_USSD_STRING;
-				gsm_7bit_decode_n_ussd((char *)req->ussd_text,
+				req->ussd_text_len = gsm_7bit_decode_n_ussd((char *)req->ussd_text,
 							sizeof(req->ussd_text),
-							&(uss_req_data[7]), num_chars);
+							&(uss_req_data[7 + offset]), num_chars);
 				rc = 1;
 			}
 		}
